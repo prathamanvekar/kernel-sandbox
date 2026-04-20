@@ -1,0 +1,11 @@
+{
+  "deny": ["execveat"],
+  "file_access": ["./", "/tmp"],
+  "network": true,
+  "block_process": false,
+  "block_file": false,
+  "block_info": false,
+  "enforce_file_access": false,
+  "kill_on_violation": false,
+  "log_file": "sandbox.log"
+}

@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Seccomp Sandbox Control Center</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg-shape bg-shape-a"></div>
+    <div class="bg-shape bg-shape-b"></div>
+
+    <header class="hero">
+      <h1>Seccomp Sandbox Control Center</h1>
+      <p class="subtitle">
+        Lightweight guardrail layer for CI jobs, plugin execution, and internal
+        automation workloads.
+      </p>
+    </header>
+
+    <main class="layout">
+      <section class="panel controls">
+        <h2>Run Controls</h2>
+        <div class="grid">
+          <label>
+            Policy
+            <select
+              id="policySelect"
+              title="Choose the sandbox policy JSON used for Run in Sandbox, Generate Report, and Run Benchmark."
+            ></select>
+          </label>
+          <label>
+            Target Program
+            <input
+              id="targetInput"
+              value="./test"
+              title="Executable to run, for example ./test"
+            />
+          </label>
+          <label class="full">
+            Program Args
+            <input
+              id="argsInput"
+              placeholder="optional arguments"
+              title="Optional command-line arguments passed to the target program"
+            />
+          </label>
+          <label>
+            Workload Label
+            <input
+              id="workloadLabelInput"
+              value="ci-smoke"
+              title="Business-friendly label (team/job/use-case) included in report metadata and filenames"
+            />
+          </label>
+          <label>
+            Benchmark Iterations
+            <input
+              id="benchIterationsInput"
+              value="5"
+              title="Number of repeated runs for average timing in benchmark"
+            />
+          </label>
+        </div>
+
+        <div class="actions">
+          <button
+            id="buildBtn"
+            class="btn accent"
+            title="Runs make clean all to rebuild sandbox-run and test"
+          >
+            Build Project
+          </button>
+          <button
+            id="runBtn"
+            class="btn"
+            title="Runs target directly without sandbox restrictions"
+          >
+            Run Baseline
+          </button>
+          <button
+            id="sandboxBtn"
+            class="btn"
+            title="Runs target through sandbox-run with the selected policy"
+          >
+            Run in Sandbox
+          </button>
+          <button
+            id="reportBtn"
+            class="btn ghost"
+            title="Runs make report and generates a detailed markdown run report"
+          >
+            Generate Report
+          </button>
+          <button
+            id="suiteBtn"
+            class="btn"
+            title="Runs baseline plus restricted scenarios and writes one suite report"
+          >
+            Run Demo Suite
+          </button>
+          <button
+            id="benchmarkBtn"
+            class="btn"
+            title="Measures baseline vs sandbox average time over N iterations"
+          >
+            Run Benchmark
+          </button>
+          <button
+            id="refreshBtn"
+            class="btn ghost"
+            title="Refreshes policy list, report list, feature status, and log tail"
+          >
+            Refresh State
+          </button>
+        </div>
+      </section>
+
+      <section class="panel coverage">
+        <h2>Project Coverage</h2>
+        <ul id="featureList" class="feature-list"></ul>
+      </section>
+
+      <section class="panel status">
+        <h2>Execution Status</h2>
+        <div class="chips">
+          <span
+            id="exitCodeChip"
+            class="chip"
+            title="Exit code of the most recent command"
+            >exit: n/a</span
+          >
+          <span
+            id="cmdChip"
+            class="chip"
+            title="Command executed by the latest action"
+            >command: n/a</span
+          >
+        </div>
+        <div id="statusLine" class="status-line">Ready.</div>
+      </section>
+
+      <section class="panel output">
+        <h2>Command Output</h2>
+        <div class="split">
+          <article>
+            <h3>STDOUT</h3>
+            <pre id="stdout"></pre>
+          </article>
+          <article>
+            <h3>STDERR</h3>
+            <pre id="stderr"></pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel policy-panel">
+        <h2>Policy Preview</h2>
+        <pre id="policyPreview"></pre>
+      </section>
+
+      <section class="panel log-panel">
+        <h2>Sandbox Log Tail</h2>
+        <pre id="logTail"></pre>
+      </section>
+
+      <section class="panel reports-panel">
+        <h2>Reports</h2>
+        <div class="reports-wrap">
+          <div class="reports-list">
+            <h3>Available (newest first)</h3>
+            <ul id="reportsList"></ul>
+          </div>
+          <div class="reports-content">
+            <h3>Selected Report</h3>
+            <pre id="reportContent"></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel howto-panel">
+        <h2>Quick Test Flow</h2>
+        <ol class="howto-list">
+          <li>
+            Fill fields: policy = restrictive.json, target = ./test, args =
+            empty, workload label = ci-smoke, iterations = 5.
+          </li>
+          <li>
+            Click Build Project. Expect exit 0 and successful compile output.
+          </li>
+          <li>
+            Click Run Baseline. Expect normal behavior and no sandbox denials.
+          </li>
+          <li>
+            Click Run in Sandbox. Expect blocked actions such as fork/socket
+            with Operation not permitted.
+          </li>
+          <li>
+            Click Generate Report. Open the top report marked LATEST to inspect
+            run summary and violations.
+          </li>
+          <li>
+            Click Run Demo Suite for combined scenarios and Run Benchmark for
+            overhead numbers.
+          </li>
+        </ol>
+      </section>
+    </main>
+
+    <footer class="footer">
+      Tip: Hover any control for purpose and expected usage.
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

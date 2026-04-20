@@ -1,0 +1,12 @@
+{
+  "allow": ["read", "write", "exit", "exit_group"],
+  "deny": ["fork", "vfork", "clone", "getpid"],
+  "file_access": ["./", "/tmp"],
+  "network": false,
+  "block_process": true,
+  "block_file": false,
+  "block_info": true,
+  "enforce_file_access": true,
+  "kill_on_violation": false,
+  "log_file": "sandbox.log"
+}

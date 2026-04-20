@@ -1,0 +1,15 @@
+# Build outputs
+sandbox-run
+test
+
+# Runtime artifacts
+sandbox.log
+trace.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+.vscode/

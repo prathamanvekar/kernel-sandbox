@@ -1,0 +1,11 @@
+{
+  "deny": [],
+  "file_access": ["./", "/tmp"],
+  "network": false,
+  "block_process": false,
+  "block_file": true,
+  "block_info": false,
+  "enforce_file_access": true,
+  "kill_on_violation": false,
+  "log_file": "sandbox.log"
+}
