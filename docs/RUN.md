@@ -145,16 +145,18 @@ Notes:
 
 - `deny`: syscall names resolved by libseccomp.
 - `network=false`: blocks common socket syscalls.
-- `block_process=true`: blocks `fork`, `vfork`, `clone`.
+- `block_process=true`: blocks `fork`, `vfork`, `clone`, and `clone3` (compat mode).
 - `block_file=true`: blocks common file mutation/destructive syscalls.
 - `block_info=true`: blocks `getpid`, `getppid`, `uname`.
-- `enforce_file_access=true`: coarse path allowlist enforcement for target binary and path-like arguments.
+- `default_deny=true`: filter default is deny; `allow` installs allow rules.
+- `landlock=true` with `enforce_file_access=true`: Landlock path-beneath rules from `file_access`.
+- `enforce_file_access=true`: also keeps coarse pre-exec argv path checks (defense-in-depth).
 - `kill_on_violation=true`: process is killed on denied syscall; otherwise denied with `EPERM`.
-- `file_access` with `enforce_file_access=true` is enforced coarsely in user-space before execution.
+- See `docs/DESIGN.md` for NNP ordering, caps/rlimits, mount-ns/`pivot_root`, and residuals.
 
-## Why `file_access` is not strict yet
+## Path policy
 
-Seccomp filters syscall numbers and primitive arguments; it cannot safely inspect pointed path strings for full path allowlisting in this design. The current implementation adds coarse pre-execution checks for target and path-like arguments, but strict runtime path confinement requires additional mechanisms (e.g., namespaces + bind mounts, chroot, or Landlock).
+Seccomp cannot inspect path strings. Prefer `landlock=true` and/or `--mount-ns` with `pivot_root`. Argv allowlisting alone is not runtime path confinement.
 
 ## Demo Suite and Benchmark
 

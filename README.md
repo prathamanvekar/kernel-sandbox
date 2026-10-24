@@ -1,118 +1,73 @@
-# Process Sandbox (seccomp-BPF)
+# Process Sandbox (seccomp-BPF + Landlock)
 
-A small Linux user-space wrapper that runs a program under a JSON-defined seccomp-BPF policy. The goal is lightweight syscall restriction for short-lived workloads, not full container or VM isolation.
+A Linux user-space launcher in C that runs a program under a JSON policy with kernel enforcement: **seccomp-BPF** (libseccomp) for the syscall surface, optional **Landlock** (`landlock_restrict_self`) for paths, optional **user/mount/PID namespaces** with **`pivot_root`**, **capability** bounding-set / ambient clear, **`prlimit`**, **`close_range`**, and explicit **`prctl(PR_SET_NO_NEW_PRIVS)`**. Structured **JSONL** audit plus a text log. Adversarial CI covers `clone3`, socket/fork denies, Landlock path deny, and an LD_PRELOAD negative control.
 
-The engine is a single C binary (`sandbox-run`) built with libseccomp. Around it, shell scripts produce Markdown run reports, and a small Python HTTP server exposes a local dashboard for build, run, suite, and benchmark flows.
+Process-level confinement for short-lived workloads, not a container runtime. Threat model and filter-install order: [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## Tech stack (shipped)
+
+`C · seccomp-BPF (libseccomp, default-deny allowlists, ERRNO/KILL_PROCESS, NO_NEW_PRIVS) · Landlock LSM · user/mount/PID/net namespaces · pivot_root · veth (optional) · cgroup v2 (memory/cpu/pids) · capabilities (bounding/ambient) · prlimit · close_range · clone3 · pidfd_open (logging) · JSONL audit · Make/CI · p50/p99 microbenchmarks · perf_event_open harness (skip if no PMU)`
+
+Not shipped (roadmap only): seccomp-user-notify, JSON Schema / PFC export, parser fuzzing.
+
+## Measured metrics (this machine)
+
+Host: Linux 6.12.94+, Intel Xeon, 4 CPUs. Methodology: `taskset -c 0` when available; attach N=40 cold launches (`policies/basic.json` → `/bin/true`, timer stops at ready-pipe after `seccomp_load`); microloops 80 samples × 2000 iters, bare vs sandboxed. Artifact: [`reports/METRICS_LATEST.md`](reports/METRICS_LATEST.md). Re-run: `make metrics`. Not portable SLAs.
+
+| Signal | Result |
+| --- | --- |
+| Attach latency p50 / p99 | 196.8 µs / 495.8 µs |
+| getpid per-op p50 bare → sandboxed | 60.5 ns → 70.1 ns |
+| open+close `/dev/null` per-op p50 bare → sandboxed | 618.2 ns → 636.8 ns |
+| write `/dev/null` per-op p50 bare → sandboxed | 74.5 ns → 83.5 ns |
+| Adversarial true-deny (`make check`) | 100% (4/4) |
+| Curated false-deny success (strict-allow file transform) | 100% (2/2) |
+| perf_event_open cycles | Unavailable here (`ENOENT`; no usable PMU). Recorded as skip, not invented. |
+
+Prefer `make microbench` / `make metrics` for overhead. Legacy `make benchmark` times `test` (includes `sleep(1)`) and is smoke-only.
 
 ## Requirements
 
-Linux with GCC, Make, and libseccomp development headers. Optional: `strace` for tracing, and access to kernel logs (`dmesg` or `journalctl`) if you want seccomp correlation in reports.
-
 ```bash
 sudo apt update
-sudo apt install -y build-essential libseccomp-dev strace
+sudo apt install -y build-essential libseccomp-dev libcap-dev strace
 ```
 
-Python 3 is only needed for the GUI (`gui/server.py` uses the standard library).
+Landlock requires a kernel with the Landlock ABI (probed; tests skip if absent). Mount/PID ns needs user namespaces. Python 3 only for the optional GUI.
 
-## Layout
-
-`sandbox.c` is the sandbox engine and builds to `sandbox-run`. `test.c` builds to `test`, a small demo target that exercises write, sleep, open, getpid, fork, and socket. JSON policies live under `policies/`. Helper scripts under `scripts/` wrap runs into Markdown under `reports/`. The GUI is `gui/server.py` plus static files in `gui/static/`. Extra narrative notes are in `docs/`.
-
-## Build
+## Build, check, measure
 
 ```bash
 make
+make check
+make metrics
 ```
-
-This produces `sandbox-run` and `test`. `make clean` removes those binaries and `sandbox.log`.
 
 ## Run
 
 ```bash
 ./sandbox-run <policy.json> <program> [args...]
+./sandbox-run --mount-ns --pid-ns policies/strict-allow.json \
+  ./workloads/file_transform /tmp/in /tmp/out
+./sandbox-run --net-ns=loopback policies/basic.json ./tests/adversarial/try_egress
+./sandbox-run --cgroup --cgroup-pids-max=4 --cgroup-memory-max=64M \
+  policies/basic.json ./tests/adversarial/try_pids_limit
 ```
 
-Example:
+`--net-ns=loopback` (or `veth-deny`) enters a user+net namespace, brings up `lo`, and leaves no default route (egress connect fails). Needs unprivileged user namespaces. `veth-deny` also needs `iproute2`.
 
-```bash
-./sandbox-run policies/restrictive.json ./test
-```
+`--cgroup` creates a leaf under `/sys/fs/cgroup/ksb.sandbox` (or `SANDBOX_CGROUP_ROOT`) with `memory.max` / `pids.max` / `cpu.max`. One-time setup: `sudo ./scripts/setup_cgroup_root.sh`. On hosts where migrating into that root needs CAP_SYS_ADMIN, attach retries via `sudo -n tee …/cgroup.procs`; if that is unavailable, cgroup tests skip.
 
-The launcher loads the policy, optionally checks the target path and path-like arguments against a coarse allowlist, forks, installs the seccomp filter in the child, then `execv`s the target. Events are appended to the policy's `log_file` (default `sandbox.log`).
+Child order: optional userns + net/mount/`pivot_root` / PID ns → cgroup attach gate → `PR_SET_NO_NEW_PRIVS` → Landlock → drop caps → `prlimit` → `close_range` → seccomp load → ready signal → `execv` (details in `docs/DESIGN.md`).
 
-Included policies:
-
-`policies/basic.json` is nearly permissive and useful as a sanity check. `policies/restrictive.json` disables network, blocks process creation and selected info syscalls, and enables coarse file-access checks. `policies/no-file-network.json` blocks common file-mutation syscalls and network.
-
-To compare behavior, run `./test` directly, then again under a policy. For syscall traces:
-
-```bash
-strace -f -o trace.log ./sandbox-run policies/restrictive.json ./test
-```
+Policies: `basic.json`, `restrictive.json`, `no-file-network.json`, `strict-allow.json`, `netns-loopback.json`, `cgroup-pids.json`.
 
 ## Policy model
 
-Policies are JSON objects parsed by a small custom reader in `sandbox.c` (not a full JSON library). Defaults apply when fields are omitted: network allowed, file-access enforcement off, kill-on-violation off, log file `sandbox.log`.
+`default_deny=true` sets filter default to `EPERM` or `KILL_PROCESS` and installs the `allow` list (compat mode remains default-allow plus deny overlays). `landlock` + `enforce_file_access` turn `file_access` prefixes into Landlock rules; argv checks are defense-in-depth only. Also: `drop_caps`, `close_fds`, `mount_ns`, `pid_ns`, `rlimit_*`, `audit_jsonl`, `kill_on_violation`. CLI: `--mount-ns`, `--pid-ns`, `--no-drop-caps`, `--audit-jsonl PATH`.
 
-Example shape:
+Seccomp does not inspect path strings. Path policy is Landlock and/or mount-ns + `pivot_root`. LD_PRELOAD is not the security boundary.
 
-```json
-{
-  "allow": ["read", "write", "exit", "exit_group"],
-  "deny": ["fork", "vfork", "clone", "getpid"],
-  "file_access": ["./", "/tmp"],
-  "network": false,
-  "block_process": true,
-  "block_file": false,
-  "block_info": true,
-  "enforce_file_access": true,
-  "kill_on_violation": false,
-  "log_file": "sandbox.log"
-}
-```
+## Layout
 
-The filter starts as allow-all (`SCMP_ACT_ALLOW`) and then applies deny rules. Syscall names in `deny` are resolved with libseccomp. Setting `network` to false installs a fixed set of socket-related denies. `block_process` denies `fork`, `vfork`, and `clone`. `block_file` denies common mutation/destructive calls such as unlink, rename, mkdir, chmod, and truncate. `block_info` denies `getpid`, `getppid`, and `uname`.
-
-If `kill_on_violation` is true, denied syscalls use `SCMP_ACT_KILL_PROCESS`; otherwise they return `EPERM`. The `allow` list is loaded and logged but not used to build an allow-only filter. Denying `execve` / `execveat` in the policy is skipped during the launcher phase so the child can still exec the target.
-
-`file_access` with `enforce_file_access` true performs a coarse pre-execution check that the resolved target and path-like argv entries fall under the listed prefixes. Seccomp does not inspect path strings, so this is not strict runtime path confinement. Stronger isolation would need mechanisms such as namespaces, bind mounts, or Landlock.
-
-## Reports, suite, and benchmark
-
-Single-run Markdown report (stdout/stderr, sandbox log slice, optional kernel seccomp lines):
-
-```bash
-make report
-make report POLICY=policies/no-file-network.json TARGET=./test
-make report POLICY=policies/restrictive.json TARGET=./test REPORT_ARGS="arg1 arg2"
-```
-
-Demo suite (baseline `./test`, then restrictive and no-file-network policies):
-
-```bash
-make demo-suite
-```
-
-Simple timing benchmark (default 5 iterations; override with `BENCH_ITERATIONS`):
-
-```bash
-make benchmark
-BENCH_ITERATIONS=10 make benchmark POLICY=policies/restrictive.json TARGET=./test
-```
-
-Scripts honor `WORKLOAD_LABEL` (default `ad-hoc`) when naming report files. Artifacts land in `reports/`. Kernel correlation tries `dmesg --since`, then `journalctl -k`; if those are unavailable to the user, the report still includes the sandbox log slice.
-
-There is no separate unit-test framework. Validation is the demo binary, the make targets above, and manual observation via `sandbox.log` / `strace`.
-
-## GUI
-
-```bash
-make gui
-```
-
-Serves `http://127.0.0.1:8080` by default. Host and port can be set with `SANDBOX_GUI_HOST` and `SANDBOX_GUI_PORT`. The dashboard can build, run the target with or without a policy, generate reports, run the demo suite and benchmark, show a log tail, and preview policies and reports. It shells out to the same Make/script paths as the CLI.
-
-## Constraints
-
-Linux and libseccomp only. The JSON parser is intentionally minimal. File-path policy is coarse and pre-exec only. This is process-level syscall filtering, not a container runtime: no namespaces, cgroups, or image layers are applied by this project.
+`sandbox.c` → `sandbox-run`. `workloads/file_transform.c` curated allowlist target. `bench/` microloops + perf companion. `tests/adversarial/` true-deny binaries. `policies/`, `scripts/`, `reports/`, `.github/workflows/ci.yml`. GUI: `make gui` → `http://127.0.0.1:8080`.

@@ -1,12 +1,17 @@
 {
+  "default_deny": false,
   "allow": ["read", "write", "exit", "exit_group"],
-  "deny": ["fork", "vfork", "clone", "getpid"],
+  "deny": ["fork", "vfork", "clone", "clone3", "getpid"],
   "file_access": ["./", "/tmp"],
   "network": false,
   "block_process": true,
   "block_file": false,
   "block_info": true,
   "enforce_file_access": true,
+  "landlock": false,
+  "drop_caps": true,
+  "close_fds": true,
   "kill_on_violation": false,
-  "log_file": "sandbox.log"
+  "log_file": "sandbox.log",
+  "audit_jsonl": "sandbox.jsonl"
 }

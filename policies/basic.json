@@ -1,4 +1,5 @@
 {
+  "default_deny": false,
   "deny": ["execveat"],
   "file_access": ["./", "/tmp"],
   "network": true,
@@ -6,6 +7,10 @@
   "block_file": false,
   "block_info": false,
   "enforce_file_access": false,
+  "landlock": false,
+  "drop_caps": true,
+  "close_fds": true,
   "kill_on_violation": false,
-  "log_file": "sandbox.log"
+  "log_file": "sandbox.log",
+  "audit_jsonl": "sandbox.jsonl"
 }
