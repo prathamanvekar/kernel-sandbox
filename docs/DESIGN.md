@@ -1,79 +1,63 @@
 # Design notes: isolation core
 
-This document records the threat model and filter-install ordering for the Phase 0/1 isolation stack. It is intentionally short and mechanism-true.
+Threat model, filter-install order, and tradeoffs for the Phase 0/1 stack. Mechanism-true: what the kernel enforces, what still escapes, and why argv or LD_PRELOAD is not the boundary.
 
 ## Threat model (what we claim)
 
-The launcher confines a short-lived child process using kernel enforcement points:
+The launcher confines a short-lived child using kernel enforcement points:
 
-1. seccomp-BPF (syscall surface): default-deny profiles install only the `allow` list; compat mode remains default-allow plus selective denies.
-2. Landlock LSM (path surface): when `landlock` and `enforce_file_access` are set, `file_access` prefixes become Landlock path-beneath rules. Argv path checks remain defense-in-depth only.
-3. Capability bounding set and ambient clear: after setup, the child drops effective/permitted/inheritable caps and clears ambient caps so exec cannot regain them.
-4. `prlimit` ceilings (`RLIMIT_AS`, `RLIMIT_NOFILE`, `RLIMIT_NPROC`) when set in policy.
-5. Optional user + mount (+ PID) namespaces with bind mounts and `pivot_root` (not `chroot`-as-security).
-6. `close_range` scrub of inherited FDs before exec.
-7. Explicit `prctl(PR_SET_NO_NEW_PRIVS)` and `PR_SET_DUMPABLE=0` before Landlock and seccomp load.
+1. **seccomp-BPF** (syscall surface). Default-deny profiles install only the JSON `allow` list. Compat mode remains default-allow plus selective denies (`network`, `block_process` including **`clone3`**, `block_file`, `block_info`, plus `deny[]`).
+2. **Landlock LSM** (path surface). When `landlock` and `enforce_file_access` are set, `file_access` prefixes become path-beneath rules via `landlock_create_ruleset` / `landlock_add_rule` / **`landlock_restrict_self`**. Argv path checks are defense-in-depth only.
+3. **Capability bounding set** and **ambient clear** after setup (`PR_CAPBSET_DROP`, `PR_CAP_AMBIENT_CLEAR_ALL`, `cap_clear` / `cap_set_proc`) so exec cannot regain dropped caps.
+4. **`prlimit`** ceilings (`RLIMIT_AS`, `RLIMIT_NOFILE`, `RLIMIT_NPROC`) when set in policy.
+5. Optional **user + mount (+ PID) namespaces** with bind mounts and **`pivot_root`** (not chroot-as-security). Parent writes `uid_map` / `gid_map` when the environment blocks self-mapping (common under AppArmor userns restrictions).
+6. **`close_range`** scrub of inherited FDs before exec (keep stdio + ready pipe).
+7. Explicit **`prctl(PR_SET_NO_NEW_PRIVS)`** and **`PR_SET_DUMPABLE=0`** before Landlock and seccomp load (libseccomp NNP attribute also set).
 
-Out of scope for this phase: seccomp-user-notify mediation, cgroup v2 resource controllers, netns/veth topologies, and unprivileged rootless demos beyond the user-ns path used for mount/PID setup.
+Out of scope this phase (roadmap only): **seccomp-user-notify**, **cgroup v2**, **netns/veth**, JSON Schema + `seccomp_export_pfc` size CI, parser fuzzing.
 
-## What still escapes (honest residual risk)
+## Tradeoffs interviewers probe
 
-- Kernel bugs and anything allowed by the policy (an over-broad allowlist is an operator error).
-- Attacks that do not need denied syscalls or denied paths (logic bugs inside an allowed workload).
-- Host-wide DoS below the configured rlimits / without cgroups.
-- Side channels (timing, cache) are not addressed.
-- If Landlock is unavailable, path policy degrades to pre-exec argv checks; the launcher prints that fact and tests skip Landlock cases.
-- Mount/PID namespace mode requires user-namespace mapping; environments that disable userns will skip or fail that path.
+**Default-deny vs deny-lists.** Deny-lists are easy to ship and easy to miss (`clone3` is the classic hole). Default-deny forces an allowlist derived from a real workload (`strace` → `policies/strict-allow.json` for `file_transform`). Compat mode stays for older profiles; `default_deny` is the least-privilege path.
 
-## LD_PRELOAD vs kernel enforcement
+**Landlock vs argv path checks.** Seccomp cannot follow userspace pointers to path strings. Pre-exec argv allowlisting is TOCTOU-ish and incomplete (the program can `open` anything once running). Landlock attaches a kernel path policy to the process. We keep argv checks as a cheap early reject, not as the FS story.
 
-Userspace interposition (`LD_PRELOAD`, ptrace helpers, wrapper libraries) is not the security boundary. A static binary or a raw syscall bypasses libc wrappers. Landlock and seccomp decisions are enforced in the kernel after `NO_NEW_PRIVS`. The adversarial suite includes a negative test that loads a fake `open` preload and still fails to read `/etc/passwd` under Landlock.
+**`pivot_root` vs `chroot`.** `chroot` does not create a private mount tree and is weak if privileges remain. Mount-ns + bind mounts + `pivot_root` + detach old root is the container-shaped FS view. If userns is unavailable, leave `mount_ns` off and rely on Landlock + seccomp; do not pretend chroot is enough.
+
+**NNP ordering.** Landlock and useful seccomp both require no-new-privs. Order: ns/`pivot_root` (needs userns root) → NNP → Landlock → drop caps → rlimits → FD scrub → seccomp → exec. Filter install after NNP so a later privileged exec cannot widen the profile.
+
+**Caps: bounding vs effective vs ambient.** Clearing effective/permitted is not enough if ambient survives exec or the bounding set still allows raising caps later. We clear ambient, drop bounding bits, then clear the process set.
+
+**LD_PRELOAD vs kernel.** Libc wrappers are not the boundary. Static binaries and raw syscalls bypass preload. The adversarial suite loads a fake `open` preload and still fails `/etc/passwd` under Landlock.
+
+## What still escapes
+
+Kernel bugs; anything the allowlist permits; logic bugs inside an allowed workload; DoS below rlimits / without cgroups; side channels. If Landlock is unavailable, path policy degrades to argv checks and tests skip. If userns is disabled, mount/PID ns fails closed or is skipped in CI with an explicit note. On this measurement VM, **`perf_event_open` returned ENOENT** (no usable PMU); cycle deltas are not claimed.
 
 ## Filter install order (child)
 
-1. Optional user/mount/PID namespace enter and `pivot_root` bind setup (needs userns root).
+1. Optional user/mount/PID namespace enter and `pivot_root` bind setup (parent maps uid/gid after child `unshare`).
 2. `prctl(PR_SET_NO_NEW_PRIVS, 1)` then `PR_SET_DUMPABLE=0`.
-3. Landlock ruleset create/add/`landlock_restrict_self` (requires NNP).
-4. Clear ambient capabilities; drop bounding set bits; `cap_clear` / `cap_set_proc`.
-5. Apply `prlimit` ceilings from policy.
-6. `close_range` scrub (preserve stdin/stdout/stderr and the ready pipe).
-7. `seccomp_init` / rule install / `seccomp_load` (libseccomp NNP attribute also set).
-8. Signal parent on the ready pipe (attach latency sample).
-9. `execv` target.
-
-Parent attach latency is measured from pre-fork/clone to the ready-pipe byte after `seccomp_load`.
+3. Landlock ruleset create/add/`landlock_restrict_self`.
+4. Ambient clear; bounding-set drop; `cap_set_proc` empty.
+5. `prlimit` from policy.
+6. `close_range` scrub.
+7. `seccomp_init` / rules / `seccomp_load`.
+8. Ready-pipe byte to parent (attach latency sample: pre-fork → this byte).
+9. `execv`.
 
 ## Seccomp actions
 
-- Default-deny profiles use `SCMP_ACT_ERRNO(EPERM)` unless `kill_on_violation` is true (`SCMP_ACT_KILL_PROCESS`).
-- Compat mode uses allow-all default plus deny overlays with the same action choice.
-- `SCMP_FLTATR_CTL_LOG` remains enabled to aid allowlist development; it is not a substitute for audit JSONL.
-
-## Process creation surface
-
-`block_process` denies `fork`, `vfork`, `clone`, and `clone3`. Missing `clone3` is a classic sandbox hole on modern glibc/pthread paths; the adversarial suite asserts it.
-
-## pivot_root vs chroot
-
-`chroot` alone does not change the mount namespace and is weak if privileges remain. The optional mount-ns path builds a private mount tree, bind-mounts allowlisted and runtime paths, then `pivot_root`s into that tree and detaches the old root. Prefer this when the environment supports user namespaces; otherwise leave `mount_ns` off and rely on Landlock + seccomp.
+Default-deny: `SCMP_ACT_ERRNO(EPERM)` unless `kill_on_violation` → `SCMP_ACT_KILL_PROCESS`. Compat: allow-all default + deny overlays with the same action. `SCMP_FLTATR_CTL_LOG` helps allowlist bring-up; JSONL is the structured audit path. Under default-deny, redundant deny overlays with the same action as the filter default are skipped (libseccomp rejects them).
 
 ## Observability
 
-- Text log: `log_file` (default `sandbox.log`).
-- Structured JSONL: `audit_jsonl` events (`start`, `forked`, `filter_installed`, `attach_ready`, `exit` / `signal`, ...).
-- Optional kernel audit netlink correlation remains a Phase 2 stretch; report scripts may still best-effort scrape `dmesg`/`journalctl` when permitted.
+Text `log_file`; JSONL `audit_jsonl` (`start`, `forked`, `filter_installed`, `attach_ready`, `exit` / `signal`, optional `pidfd_opened`). Audit netlink correlation is Phase 2; report scripts may still best-effort scrape `dmesg`/`journalctl`.
 
-## Policy fields (Phase 0/1 additions)
+## Policy / CLI surface
 
-`default_deny`, `landlock`, `drop_caps`, `mount_ns`, `pid_ns`, `close_fds`, `rlimit_as_mb`, `rlimit_nofile`, `rlimit_nproc`, `audit_jsonl`.
+Fields: `default_deny`, `allow`, `deny`, `file_access`, `landlock`, `enforce_file_access`, `drop_caps`, `mount_ns`, `pid_ns`, `close_fds`, `rlimit_as_mb`, `rlimit_nofile`, `rlimit_nproc`, `audit_jsonl`, `kill_on_violation`, block flags. CLI: `--mount-ns`, `--pid-ns`, `--no-drop-caps`, `--audit-jsonl PATH`.
 
-CLI overrides: `--mount-ns`, `--pid-ns`, `--no-drop-caps`, `--audit-jsonl PATH`.
+## Deferred (Phase 2)
 
-## TODOs / deferred (Phase 2)
-
-- seccomp-user-notify supervisor for dynamic `openat`/`connect` decisions.
-- Broader rootless user-ns failure matrix across distros.
-- Netns + veth deny topology with measured enter cost.
-- cgroup v2 memory/CPU demos.
-- JSON Schema validation + `seccomp_export_pfc` filter-size reports in CI.
-- Fuzzing the policy parser; multi-threaded filter inheritance tests.
+seccomp-user-notify supervisor; broader rootless userns matrix; netns + veth; cgroup v2 memory/CPU; JSON Schema + PFC export; parser fuzzing; multi-threaded filter inheritance tests.
