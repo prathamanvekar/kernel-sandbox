@@ -2,7 +2,7 @@
 
 A Linux user-space launcher in C that runs a program under a JSON policy with kernel enforcement: **seccomp-BPF** (libseccomp) for the syscall surface, optional **Landlock** (`landlock_restrict_self`) for paths, optional **user/mount/PID namespaces** with **`pivot_root`**, **capability** bounding-set / ambient clear, **`prlimit`**, **`close_range`**, and explicit **`prctl(PR_SET_NO_NEW_PRIVS)`**. Structured **JSONL** audit plus a text log. Adversarial CI covers `clone3`, socket/fork denies, Landlock path deny, and an LD_PRELOAD negative control.
 
-Process-level confinement for short-lived workloads, not a container runtime. Threat model and filter-install order: [`docs/DESIGN.md`](docs/DESIGN.md). Resume drafts with these numbers: [`docs/RESUME_BULLETS.md`](docs/RESUME_BULLETS.md).
+Process-level confinement for short-lived workloads, not a container runtime. Threat model and filter-install order: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Tech stack (shipped)
 
