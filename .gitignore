@@ -1,9 +1,20 @@
 # Build outputs
 sandbox-run
 test
+workloads/file_transform
+bench/micro_syscall
+bench/perf_cycles
+tests/adversarial/try_clone3
+tests/adversarial/try_socket
+tests/adversarial/try_open_etc
+tests/adversarial/try_fork
+tests/adversarial/ld_preload_open
+tests/adversarial/landlock_probe
+tests/adversarial/libfake_preload.so
 
 # Runtime artifacts
 sandbox.log
+sandbox.jsonl
 trace.log
 
 # Python cache
