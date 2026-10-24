@@ -1,0 +1,16 @@
+{
+  "default_deny": false,
+  "deny": [],
+  "network": true,
+  "block_process": false,
+  "block_file": false,
+  "block_info": false,
+  "enforce_file_access": false,
+  "landlock": false,
+  "net_ns": "loopback",
+  "drop_caps": true,
+  "close_fds": true,
+  "kill_on_violation": false,
+  "log_file": "sandbox.log",
+  "audit_jsonl": "sandbox.jsonl"
+}

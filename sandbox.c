@@ -14,10 +14,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <net/if.h>
 #include <sys/capability.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -52,9 +55,15 @@ typedef struct {
     bool mount_ns;
     bool pid_ns;
     bool close_fds;
+    bool cgroup;
     long rlimit_as_mb;
     long rlimit_nofile;
     long rlimit_nproc;
+    long cgroup_pids_max;
+    char net_ns_mode[32]; /* "", "loopback", "veth-deny" */
+    char cgroup_root[PATH_MAX];
+    char cgroup_memory_max[64];
+    char cgroup_cpu_max[64]; /* e.g. "10000 100000" or "max" */
     char log_file[PATH_MAX];
     char audit_jsonl[PATH_MAX];
 } sandbox_policy;
@@ -65,6 +74,7 @@ typedef struct {
     char **child_argv;
     int ready_fd;
     int map_sync_fd; /* bidirectional sync for userns maps when required */
+    int cgroup_gate_fd; /* child blocks until parent finishes cgroup attach */
     char run_id[64];
     const char *policy_path;
 } child_ctx;
@@ -525,9 +535,15 @@ static void set_policy_defaults(sandbox_policy *policy) {
     policy->mount_ns = false;
     policy->pid_ns = false;
     policy->close_fds = true;
+    policy->cgroup = false;
     policy->rlimit_as_mb = -1;
     policy->rlimit_nofile = -1;
     policy->rlimit_nproc = -1;
+    policy->cgroup_pids_max = -1;
+    policy->net_ns_mode[0] = '\0';
+    policy->cgroup_root[0] = '\0';
+    policy->cgroup_memory_max[0] = '\0';
+    policy->cgroup_cpu_max[0] = '\0';
     snprintf(policy->log_file, sizeof(policy->log_file), "sandbox.log");
     policy->audit_jsonl[0] = '\0';
 }
@@ -595,7 +611,61 @@ static int load_policy(const char *policy_path, sandbox_policy *policy) {
     PARSE_BOOL_FIELD("mount_ns", mount_ns);
     PARSE_BOOL_FIELD("pid_ns", pid_ns);
     PARSE_BOOL_FIELD("close_fds", close_fds);
+    PARSE_BOOL_FIELD("cgroup", cgroup);
 #undef PARSE_BOOL_FIELD
+
+    rc = parse_string(json, "net_ns", policy->net_ns_mode, sizeof(policy->net_ns_mode));
+    if (rc < 0) {
+        fprintf(stderr, "[Policy] Invalid net_ns string (use \"\", \"loopback\", or \"veth-deny\")\n");
+        free_policy(policy);
+        free(json);
+        return -1;
+    }
+    if (rc > 0) {
+        if (strcmp(policy->net_ns_mode, "off") == 0 || strcmp(policy->net_ns_mode, "false") == 0) {
+            policy->net_ns_mode[0] = '\0';
+        } else if (strcmp(policy->net_ns_mode, "loopback") != 0 &&
+                   strcmp(policy->net_ns_mode, "veth-deny") != 0 && policy->net_ns_mode[0] != '\0') {
+            fprintf(stderr, "[Policy] Unsupported net_ns mode: %s\n", policy->net_ns_mode);
+            free_policy(policy);
+            free(json);
+            return -1;
+        }
+    }
+
+    rc = parse_string(json, "cgroup_root", policy->cgroup_root, sizeof(policy->cgroup_root));
+    if (rc < 0) {
+        fprintf(stderr, "[Policy] Invalid cgroup_root\n");
+        free_policy(policy);
+        free(json);
+        return -1;
+    }
+    rc = parse_string(json, "cgroup_memory_max", policy->cgroup_memory_max,
+                      sizeof(policy->cgroup_memory_max));
+    if (rc < 0) {
+        fprintf(stderr, "[Policy] Invalid cgroup_memory_max\n");
+        free_policy(policy);
+        free(json);
+        return -1;
+    }
+    rc = parse_string(json, "cgroup_cpu_max", policy->cgroup_cpu_max, sizeof(policy->cgroup_cpu_max));
+    if (rc < 0) {
+        fprintf(stderr, "[Policy] Invalid cgroup_cpu_max\n");
+        free_policy(policy);
+        free(json);
+        return -1;
+    }
+
+    rc = parse_long(json, "cgroup_pids_max", &lv);
+    if (rc < 0) {
+        fprintf(stderr, "[Policy] Invalid cgroup_pids_max\n");
+        free_policy(policy);
+        free(json);
+        return -1;
+    }
+    if (rc > 0) {
+        policy->cgroup_pids_max = lv;
+    }
 
     rc = parse_long(json, "rlimit_as_mb", &lv);
     if (rc < 0) {
@@ -1107,6 +1177,288 @@ static int bind_mount_path(const char *src, const char *dst, bool read_only) {
     return 0;
 }
 
+static int net_if_set_flags(const char *ifname, short flags_on) {
+    struct ifreq ifr;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) != 0) {
+        close(fd);
+        return -1;
+    }
+    ifr.ifr_flags |= flags_on;
+    if (ioctl(fd, SIOCSIFFLAGS, &ifr) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int run_ip(char *const argv[]) {
+    pid_t pid = fork();
+    int st = 0;
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_WRONLY);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDOUT_FILENO);
+            dup2(nullfd, STDERR_FILENO);
+            close(nullfd);
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    if (waitpid(pid, &st, 0) < 0) {
+        return -1;
+    }
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Assumes caller is already root in a user+net namespace. */
+static int setup_net_ns(const sandbox_policy *policy) {
+    if (policy->net_ns_mode[0] == '\0') {
+        return 0;
+    }
+
+    if (unshare(CLONE_NEWNET) != 0) {
+        perror("unshare(CLONE_NEWNET)");
+        return -1;
+    }
+
+    if (net_if_set_flags("lo", IFF_UP) != 0) {
+        perror("bring up lo");
+        return -1;
+    }
+    printf("[NetNS] loopback up (mode=%s)\n", policy->net_ns_mode);
+
+    if (strcmp(policy->net_ns_mode, "veth-deny") == 0) {
+        char *add_argv[] = {"ip", "link", "add", "ksb0", "type", "veth", "peer", "name", "ksb1",
+                            NULL};
+        char *up_argv[] = {"ip", "link", "set", "ksb0", "up", NULL};
+        char *addr_argv[] = {"ip", "addr", "add", "10.200.255.1/30", "dev", "ksb0", NULL};
+        /* Peer ksb1 stays DOWN: no usable L2 path even inside the ns. No default route. */
+        if (run_ip(add_argv) != 0) {
+            fprintf(stderr,
+                    "[NetNS] veth create failed (need iproute2 + CAP_NET_ADMIN in userns). "
+                    "Falling back to loopback-only.\n");
+        } else {
+            (void)run_ip(addr_argv);
+            (void)run_ip(up_argv);
+            printf("[NetNS] veth ksb0 up, peer ksb1 left DOWN (egress/path deny demo)\n");
+        }
+    }
+
+    return 0;
+}
+
+static int write_cgroup_file(const char *dir, const char *name, const char *value) {
+    char path[PATH_MAX];
+    int fd;
+    size_t len;
+
+    if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path)) {
+        return -1;
+    }
+    fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0) {
+        return -1;
+    }
+    len = strlen(value);
+    if (write(fd, value, len) != (ssize_t)len) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+static int cgroup_resolve_root(const sandbox_policy *policy, char *out, size_t out_sz) {
+    const char *env = getenv("SANDBOX_CGROUP_ROOT");
+    const char *candidates[4];
+    size_t n = 0;
+    size_t i;
+
+    if (policy->cgroup_root[0]) {
+        candidates[n++] = policy->cgroup_root;
+    }
+    if (env && env[0]) {
+        candidates[n++] = env;
+    }
+    candidates[n++] = "/sys/fs/cgroup/ksb.sandbox";
+    candidates[n++] = NULL;
+
+    for (i = 0; i < n && candidates[i]; ++i) {
+        char probe[PATH_MAX];
+        struct stat st;
+        if (stat(candidates[i], &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+        if (snprintf(probe, sizeof(probe), "%s/.ksb_write_probe", candidates[i]) >=
+            (int)sizeof(probe)) {
+            continue;
+        }
+        if (mkdir(probe, 0755) == 0) {
+            rmdir(probe);
+            snprintf(out, out_sz, "%s", candidates[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Create a leaf cgroup under a writable cgroup v2 root with requested controllers.
+ * Requires the parent to already have memory/cpu/pids in cgroup.subtree_control
+ * (see docs). Returns 0 and fills created_path; -1 if unavailable.
+ */
+static int cgroup_create(const sandbox_policy *policy, char *created_path, size_t created_sz) {
+    char root[PATH_MAX];
+    char leaf[PATH_MAX];
+    char buf[128];
+
+    if (!policy->cgroup) {
+        created_path[0] = '\0';
+        return 0;
+    }
+
+    if (cgroup_resolve_root(policy, root, sizeof(root)) != 0) {
+        fprintf(stderr,
+                "[Cgroup] No writable cgroup v2 root. Create e.g. /sys/fs/cgroup/ksb.sandbox "
+                "owned by this user with '+memory +cpu +pids' in cgroup.subtree_control, "
+                "or set SANDBOX_CGROUP_ROOT. Skipping cgroup limits.\n");
+        return 1; /* soft skip */
+    }
+
+    if (snprintf(leaf, sizeof(leaf), "%s/run-%d-%ld", root, (int)getpid(), (long)time(NULL)) >=
+        (int)sizeof(leaf)) {
+        return -1;
+    }
+    if (mkdir(leaf, 0755) != 0) {
+        perror("mkdir(cgroup leaf)");
+        return -1;
+    }
+
+    if (policy->cgroup_memory_max[0]) {
+        if (write_cgroup_file(leaf, "memory.max", policy->cgroup_memory_max) != 0) {
+            fprintf(stderr, "[Cgroup] failed to set memory.max=%s (%s)\n",
+                    policy->cgroup_memory_max, strerror(errno));
+            rmdir(leaf);
+            return -1;
+        }
+    }
+    if (policy->cgroup_pids_max >= 0) {
+        snprintf(buf, sizeof(buf), "%ld", policy->cgroup_pids_max);
+        if (write_cgroup_file(leaf, "pids.max", buf) != 0) {
+            fprintf(stderr, "[Cgroup] failed to set pids.max (%s)\n", strerror(errno));
+            rmdir(leaf);
+            return -1;
+        }
+    }
+    if (policy->cgroup_cpu_max[0]) {
+        if (write_cgroup_file(leaf, "cpu.max", policy->cgroup_cpu_max) != 0) {
+            fprintf(stderr, "[Cgroup] failed to set cpu.max=%s (%s)\n", policy->cgroup_cpu_max,
+                    strerror(errno));
+            rmdir(leaf);
+            return -1;
+        }
+    }
+
+    snprintf(created_path, created_sz, "%s", leaf);
+    printf("[Cgroup] leaf %s memory.max=%s pids.max=%ld cpu.max=%s\n", leaf,
+           policy->cgroup_memory_max[0] ? policy->cgroup_memory_max : "(unchanged)",
+           policy->cgroup_pids_max, policy->cgroup_cpu_max[0] ? policy->cgroup_cpu_max : "(unchanged)");
+    return 0;
+}
+
+static int cgroup_attach_pid(const char *cgroup_path, pid_t pid) {
+    char buf[32];
+    char procs_path[PATH_MAX];
+    if (!cgroup_path || !cgroup_path[0]) {
+        return 0;
+    }
+    snprintf(buf, sizeof(buf), "%d\n", (int)pid);
+    if (write_cgroup_file(cgroup_path, "cgroup.procs", buf) == 0) {
+        return 0;
+    }
+    /*
+     * Crossing into a delegated root like /sys/fs/cgroup/ksb.sandbox from a
+     * nested service cgroup often needs CAP_SYS_ADMIN. Retry via passwordless
+     * sudo when available; otherwise the caller skips/fails honestly.
+     */
+    if (snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", cgroup_path) >=
+        (int)sizeof(procs_path)) {
+        return -1;
+    }
+    {
+        int pipefd[2];
+        pid_t helper;
+        int st = 0;
+        if (pipe(pipefd) != 0) {
+            return -1;
+        }
+        helper = fork();
+        if (helper < 0) {
+            close(pipefd[0]);
+            close(pipefd[1]);
+            return -1;
+        }
+        if (helper == 0) {
+            int fd;
+            char *sudo_argv[5];
+            close(pipefd[1]);
+            dup2(pipefd[0], STDIN_FILENO);
+            close(pipefd[0]);
+            fd = open("/dev/null", O_WRONLY);
+            if (fd >= 0) {
+                dup2(fd, STDOUT_FILENO);
+                dup2(fd, STDERR_FILENO);
+                close(fd);
+            }
+            sudo_argv[0] = "sudo";
+            sudo_argv[1] = "-n";
+            sudo_argv[2] = "tee";
+            sudo_argv[3] = procs_path;
+            sudo_argv[4] = NULL;
+            execvp(sudo_argv[0], sudo_argv);
+            _exit(127);
+        }
+        close(pipefd[0]);
+        if (write(pipefd[1], buf, strlen(buf)) < 0) {
+            /* ignore */
+        }
+        close(pipefd[1]);
+        if (waitpid(helper, &st, 0) < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+            fprintf(stderr,
+                    "[Cgroup] failed to move pid %d into %s (direct write errno was %s; "
+                    "sudo -n tee also failed). Create a writable root under the current "
+                    "cgroup tree or grant passwordless sudo for tee on cgroup.procs.\n",
+                    (int)pid, cgroup_path, strerror(errno));
+            return -1;
+        }
+        printf("[Cgroup] attached pid %d via sudo -n tee\n", (int)pid);
+        return 0;
+    }
+}
+
+static void cgroup_cleanup(const char *cgroup_path) {
+    if (!cgroup_path || !cgroup_path[0]) {
+        return;
+    }
+    if (rmdir(cgroup_path) != 0) {
+        /* Best-effort; leaf may still be busy briefly. */
+        fprintf(stderr, "[Cgroup] rmdir(%s): %s\n", cgroup_path, strerror(errno));
+    }
+}
+
 static int setup_mount_ns(const sandbox_policy *policy, const char *target_exec) {
     char root[PATH_MAX];
     char put_old[PATH_MAX];
@@ -1284,6 +1636,16 @@ static int child_prepare_and_exec(child_ctx *ctx) {
     /* Namespace/pivot_root setup (if requested) is completed by the caller
      * before this function, after parent writes uid/gid maps. */
 
+    if (ctx->cgroup_gate_fd >= 0) {
+        char b = 0;
+        if (read(ctx->cgroup_gate_fd, &b, 1) != 1 || b != 'C') {
+            fprintf(stderr, "[Child] cgroup gate sync failed\n");
+            _exit(38);
+        }
+        close(ctx->cgroup_gate_fd);
+        ctx->cgroup_gate_fd = -1;
+    }
+
     /* Order: NNP -> Landlock -> caps/rlimits -> FD scrub -> seccomp -> exec.
      * Landlock and useful seccomp both require NO_NEW_PRIVS. */
     if (set_no_new_privs() < 0) {
@@ -1345,11 +1707,17 @@ static void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s [options] <policy.json> <program> [args...]\n"
             "Options:\n"
-            "  --mount-ns          Enter a mount namespace and pivot_root (needs user ns)\n"
-            "  --pid-ns            Enter a PID namespace (needs user ns)\n"
-            "  --no-drop-caps      Skip capability drop\n"
-            "  --audit-jsonl PATH  Override audit JSONL path\n"
-            "  --help              Show this help\n",
+            "  --mount-ns              Enter a mount namespace and pivot_root (needs user ns)\n"
+            "  --pid-ns                Enter a PID namespace (needs user ns)\n"
+            "  --net-ns=MODE           Network ns: loopback | veth-deny (needs user ns)\n"
+            "  --cgroup                Enable cgroup v2 leaf (needs writable cgroup root)\n"
+            "  --cgroup-memory-max=V   e.g. 32M\n"
+            "  --cgroup-pids-max=N     e.g. 8\n"
+            "  --cgroup-cpu-max=V      e.g. '10000 100000' (quota period)\n"
+            "  --cgroup-root=PATH      Override cgroup v2 root (or SANDBOX_CGROUP_ROOT)\n"
+            "  --no-drop-caps          Skip capability drop\n"
+            "  --audit-jsonl PATH      Override audit JSONL path\n"
+            "  --help                  Show this help\n",
             argv0);
 }
 
@@ -1364,14 +1732,25 @@ int main(int argc, char *argv[]) {
     bool cli_mount_ns = false;
     bool cli_pid_ns = false;
     bool cli_no_drop_caps = false;
+    bool cli_cgroup = false;
     const char *cli_audit = NULL;
+    const char *cli_net_ns = NULL;
+    const char *cli_cg_mem = NULL;
+    const char *cli_cg_cpu = NULL;
+    const char *cli_cg_root = NULL;
+    long cli_cg_pids = -1;
     int ready_pipe[2] = {-1, -1};
     int map_from_child[2] = {-1, -1};
     int map_to_child[2] = {-1, -1};
+    int cgroup_gate[2] = {-1, -1};
     int64_t t0, t1;
     char run_id[64];
+    char cgroup_path[PATH_MAX];
     child_ctx ctx;
     bool use_userns = false;
+    int cg_rc;
+
+    cgroup_path[0] = '\0';
 
     while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
         if (strcmp(argv[argi], "--help") == 0) {
@@ -1381,6 +1760,18 @@ int main(int argc, char *argv[]) {
             cli_mount_ns = true;
         } else if (strcmp(argv[argi], "--pid-ns") == 0) {
             cli_pid_ns = true;
+        } else if (strncmp(argv[argi], "--net-ns=", 9) == 0) {
+            cli_net_ns = argv[argi] + 9;
+        } else if (strcmp(argv[argi], "--cgroup") == 0) {
+            cli_cgroup = true;
+        } else if (strncmp(argv[argi], "--cgroup-memory-max=", 20) == 0) {
+            cli_cg_mem = argv[argi] + 20;
+        } else if (strncmp(argv[argi], "--cgroup-pids-max=", 18) == 0) {
+            cli_cg_pids = strtol(argv[argi] + 18, NULL, 10);
+        } else if (strncmp(argv[argi], "--cgroup-cpu-max=", 17) == 0) {
+            cli_cg_cpu = argv[argi] + 17;
+        } else if (strncmp(argv[argi], "--cgroup-root=", 14) == 0) {
+            cli_cg_root = argv[argi] + 14;
         } else if (strcmp(argv[argi], "--no-drop-caps") == 0) {
             cli_no_drop_caps = true;
         } else if (strcmp(argv[argi], "--audit-jsonl") == 0) {
@@ -1413,6 +1804,30 @@ int main(int argc, char *argv[]) {
     }
     if (cli_pid_ns) {
         policy.pid_ns = true;
+    }
+    if (cli_net_ns) {
+        snprintf(policy.net_ns_mode, sizeof(policy.net_ns_mode), "%s", cli_net_ns);
+        if (strcmp(policy.net_ns_mode, "off") == 0) {
+            policy.net_ns_mode[0] = '\0';
+        }
+    }
+    if (cli_cgroup) {
+        policy.cgroup = true;
+    }
+    if (cli_cg_mem) {
+        snprintf(policy.cgroup_memory_max, sizeof(policy.cgroup_memory_max), "%s", cli_cg_mem);
+        policy.cgroup = true;
+    }
+    if (cli_cg_pids >= 0) {
+        policy.cgroup_pids_max = cli_cg_pids;
+        policy.cgroup = true;
+    }
+    if (cli_cg_cpu) {
+        snprintf(policy.cgroup_cpu_max, sizeof(policy.cgroup_cpu_max), "%s", cli_cg_cpu);
+        policy.cgroup = true;
+    }
+    if (cli_cg_root) {
+        snprintf(policy.cgroup_root, sizeof(policy.cgroup_root), "%s", cli_cg_root);
     }
     if (cli_no_drop_caps) {
         policy.drop_caps = false;
@@ -1470,17 +1885,32 @@ int main(int argc, char *argv[]) {
     printf("\n========== SANDBOX ENGINE START ==========\n");
     printf("[Main] Policy file: %s\n", argv[argi]);
     printf("[Main] Target: %s\n", target_exec);
-    printf("[Main] Mode: %s | landlock=%s | mount_ns=%s | pid_ns=%s\n",
+    printf("[Main] Mode: %s | landlock=%s | mount_ns=%s | pid_ns=%s | net_ns=%s | cgroup=%s\n",
            policy.default_deny ? "default-deny" : "compat-allow",
            policy.landlock ? "on" : "off", policy.mount_ns ? "on" : "off",
-           policy.pid_ns ? "on" : "off");
+           policy.pid_ns ? "on" : "off",
+           policy.net_ns_mode[0] ? policy.net_ns_mode : "off", policy.cgroup ? "on" : "off");
 
     log_line(&policy, "Starting sandbox policy=%s target=%s", argv[argi], argv[argi + 1]);
     audit_jsonl(&policy, run_id, "start", getpid(),
                 "\"policy\":\"%s\",\"target\":\"%s\"", argv[argi], target_exec);
 
+    cg_rc = cgroup_create(&policy, cgroup_path, sizeof(cgroup_path));
+    if (cg_rc < 0) {
+        free(child_argv);
+        free(target_exec);
+        free_policy(&policy);
+        return 1;
+    }
+    if (cg_rc > 0) {
+        /* Soft skip: continue without cgroup limits. */
+        policy.cgroup = false;
+        cgroup_path[0] = '\0';
+    }
+
     if (pipe(ready_pipe) != 0) {
         perror("pipe");
+        cgroup_cleanup(cgroup_path);
         free(child_argv);
         free(target_exec);
         free_policy(&policy);
@@ -1493,18 +1923,31 @@ int main(int argc, char *argv[]) {
     ctx.child_argv = child_argv;
     ctx.ready_fd = ready_pipe[1];
     ctx.map_sync_fd = -1;
+    ctx.cgroup_gate_fd = -1;
     snprintf(ctx.run_id, sizeof(ctx.run_id), "%s", run_id);
     ctx.policy_path = argv[argi];
 
-    use_userns = policy.mount_ns || policy.pid_ns;
+    use_userns = policy.mount_ns || policy.pid_ns || policy.net_ns_mode[0] != '\0';
     if (use_userns) {
         if (pipe(map_from_child) != 0 || pipe(map_to_child) != 0) {
             perror("pipe(map sync)");
+            cgroup_cleanup(cgroup_path);
             free(child_argv);
             free(target_exec);
             free_policy(&policy);
             return 1;
         }
+    }
+    if (cgroup_path[0]) {
+        if (pipe(cgroup_gate) != 0) {
+            perror("pipe(cgroup gate)");
+            cgroup_cleanup(cgroup_path);
+            free(child_argv);
+            free(target_exec);
+            free_policy(&policy);
+            return 1;
+        }
+        ctx.cgroup_gate_fd = cgroup_gate[0];
     }
 
     fflush(NULL);
@@ -1519,10 +1962,13 @@ int main(int argc, char *argv[]) {
 
     if (pid == 0) {
         close(ready_pipe[0]);
+        if (cgroup_path[0]) {
+            close(cgroup_gate[1]);
+            ctx.cgroup_gate_fd = cgroup_gate[0];
+        }
         if (use_userns) {
             close(map_from_child[0]);
             close(map_to_child[1]);
-            /* Reuse map_sync_fd as write-end for 'U'; read map_to_child[0] for 'G'. */
             {
                 int uflags = CLONE_NEWUSER;
                 char b = 0;
@@ -1560,6 +2006,12 @@ int main(int argc, char *argv[]) {
                         }
                     }
                 }
+                if (policy.net_ns_mode[0]) {
+                    if (setup_net_ns(&policy) < 0) {
+                        fprintf(stderr, "[Child] net namespace setup failed\n");
+                        _exit(37);
+                    }
+                }
                 if (policy.mount_ns) {
                     if (setup_mount_ns(&policy, target_exec) < 0) {
                         fprintf(stderr, "[Child] mount namespace / pivot_root setup failed\n");
@@ -1570,6 +2022,24 @@ int main(int argc, char *argv[]) {
         }
         child_prepare_and_exec(&ctx);
         _exit(1);
+    }
+
+    if (cgroup_path[0]) {
+        char go = 'C';
+        int attach_rc;
+        close(cgroup_gate[0]);
+        attach_rc = cgroup_attach_pid(cgroup_path, pid);
+        if (attach_rc != 0) {
+            audit_jsonl(&policy, run_id, "cgroup_attach_failed", pid, "\"path\":\"%s\"",
+                        cgroup_path);
+            close(cgroup_gate[1]); /* child will fail the gate and exit */
+        } else {
+            audit_jsonl(&policy, run_id, "cgroup_attached", pid, "\"path\":\"%s\"", cgroup_path);
+            if (write(cgroup_gate[1], &go, 1) != 1) {
+                perror("cgroup gate");
+            }
+            close(cgroup_gate[1]);
+        }
     }
 
     if (use_userns) {
@@ -1623,6 +2093,7 @@ int main(int argc, char *argv[]) {
     }
 
     waitpid(pid, &status, 0);
+    cgroup_cleanup(cgroup_path);
 
     printf("\n========== SANDBOX ENGINE END ==========\n");
     if (WIFSIGNALED(status)) {

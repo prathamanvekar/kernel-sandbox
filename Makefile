@@ -11,7 +11,10 @@ ADVERSARIAL_BINS := \
 	tests/adversarial/try_open_etc \
 	tests/adversarial/try_fork \
 	tests/adversarial/ld_preload_open \
-	tests/adversarial/landlock_probe
+	tests/adversarial/landlock_probe \
+	tests/adversarial/try_egress \
+	tests/adversarial/try_loopback \
+	tests/adversarial/try_pids_limit
 
 .PHONY: all clean report gui demo-suite benchmark check check-bins microbench metrics
 
@@ -50,13 +53,23 @@ tests/adversarial/ld_preload_open: tests/adversarial/ld_preload_open.c
 tests/adversarial/landlock_probe: tests/adversarial/landlock_probe.c
 	$(CC) $(CFLAGS) $< -o $@
 
+tests/adversarial/try_egress: tests/adversarial/try_egress.c
+	$(CC) $(CFLAGS) $< -o $@
+
+tests/adversarial/try_loopback: tests/adversarial/try_loopback.c
+	$(CC) $(CFLAGS) $< -o $@
+
+tests/adversarial/try_pids_limit: tests/adversarial/try_pids_limit.c
+	$(CC) $(CFLAGS) $< -o $@
+
 tests/adversarial/libfake_preload.so: tests/adversarial/fake_preload.c
 	$(CC) $(CFLAGS) -shared -fPIC $< -o $@ -ldl
 
 check-bins: $(ADVERSARIAL_BINS) tests/adversarial/libfake_preload.so workloads/file_transform
 
 check: all check-bins
-	chmod +x tests/run_check.sh scripts/run_microbench.sh scripts/collect_metrics.sh
+	chmod +x tests/run_check.sh tests/adversarial/cgroup_probe.sh \
+		scripts/run_microbench.sh scripts/collect_metrics.sh scripts/setup_cgroup_root.sh
 	./tests/run_check.sh
 
 microbench: all

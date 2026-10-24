@@ -11,10 +11,12 @@ The launcher confines a short-lived child using kernel enforcement points:
 3. **Capability bounding set** and **ambient clear** after setup (`PR_CAPBSET_DROP`, `PR_CAP_AMBIENT_CLEAR_ALL`, `cap_clear` / `cap_set_proc`) so exec cannot regain dropped caps.
 4. **`prlimit`** ceilings (`RLIMIT_AS`, `RLIMIT_NOFILE`, `RLIMIT_NPROC`) when set in policy.
 5. Optional **user + mount (+ PID) namespaces** with bind mounts and **`pivot_root`** (not chroot-as-security). Parent writes `uid_map` / `gid_map` when the environment blocks self-mapping (common under AppArmor userns restrictions).
-6. **`close_range`** scrub of inherited FDs before exec (keep stdio + ready pipe).
-7. Explicit **`prctl(PR_SET_NO_NEW_PRIVS)`** and **`PR_SET_DUMPABLE=0`** before Landlock and seccomp load (libseccomp NNP attribute also set).
+6. Optional **net namespace** (`net_ns=loopback|veth-deny`): `unshare(CLONE_NEWNET)`, bring up `lo`; `veth-deny` adds a veth pair with the peer left DOWN (needs `ip`). No default route → egress `connect` fails (`ENETUNREACH`).
+7. Optional **cgroup v2** leaf under a writable root (`/sys/fs/cgroup/ksb.sandbox` or `SANDBOX_CGROUP_ROOT`) with `memory.max` / `pids.max` / `cpu.max`. Parent attaches the child before exec (gate pipe); may need `sudo -n tee` to migrate across cgroup trees. Leaf is `rmdir`'d after wait.
+8. **`close_range`** scrub of inherited FDs before exec (keep stdio + ready pipe).
+9. Explicit **`prctl(PR_SET_NO_NEW_PRIVS)`** and **`PR_SET_DUMPABLE=0`** before Landlock and seccomp load (libseccomp NNP attribute also set).
 
-Out of scope this phase (roadmap only): **seccomp-user-notify**, **cgroup v2**, **netns/veth**, JSON Schema + `seccomp_export_pfc` size CI, parser fuzzing.
+Out of scope (roadmap only): **seccomp-user-notify**, JSON Schema + `seccomp_export_pfc` size CI, parser fuzzing.
 
 ## Tradeoffs interviewers probe
 
@@ -58,6 +60,6 @@ Text `log_file`; JSONL `audit_jsonl` (`start`, `forked`, `filter_installed`, `at
 
 Fields: `default_deny`, `allow`, `deny`, `file_access`, `landlock`, `enforce_file_access`, `drop_caps`, `mount_ns`, `pid_ns`, `close_fds`, `rlimit_as_mb`, `rlimit_nofile`, `rlimit_nproc`, `audit_jsonl`, `kill_on_violation`, block flags. CLI: `--mount-ns`, `--pid-ns`, `--no-drop-caps`, `--audit-jsonl PATH`.
 
-## Deferred (Phase 2)
+## Deferred
 
-seccomp-user-notify supervisor; broader rootless userns matrix; netns + veth; cgroup v2 memory/CPU; JSON Schema + PFC export; parser fuzzing; multi-threaded filter inheritance tests.
+seccomp-user-notify supervisor; broader rootless userns matrix; JSON Schema + PFC export; parser fuzzing; multi-threaded filter inheritance tests.

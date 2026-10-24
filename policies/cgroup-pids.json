@@ -1,0 +1,15 @@
+{
+  "default_deny": false,
+  "deny": [],
+  "network": true,
+  "cgroup": true,
+  "cgroup_root": "/sys/fs/cgroup/ksb.sandbox",
+  "cgroup_pids_max": 4,
+  "cgroup_memory_max": "64M",
+  "cgroup_cpu_max": "max",
+  "drop_caps": true,
+  "close_fds": true,
+  "kill_on_violation": false,
+  "log_file": "sandbox.log",
+  "audit_jsonl": "sandbox.jsonl"
+}

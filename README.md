@@ -6,9 +6,9 @@ Process-level confinement for short-lived workloads, not a container runtime. Th
 
 ## Tech stack (shipped)
 
-`C · seccomp-BPF (libseccomp, default-deny allowlists, ERRNO/KILL_PROCESS, NO_NEW_PRIVS) · Landlock LSM · user/mount/PID namespaces · pivot_root · capabilities (bounding/ambient) · prlimit · close_range · clone3 · pidfd_open (logging) · JSONL audit · Make/CI · p50/p99 microbenchmarks · perf_event_open harness (skip if no PMU)`
+`C · seccomp-BPF (libseccomp, default-deny allowlists, ERRNO/KILL_PROCESS, NO_NEW_PRIVS) · Landlock LSM · user/mount/PID/net namespaces · pivot_root · veth (optional) · cgroup v2 (memory/cpu/pids) · capabilities (bounding/ambient) · prlimit · close_range · clone3 · pidfd_open (logging) · JSONL audit · Make/CI · p50/p99 microbenchmarks · perf_event_open harness (skip if no PMU)`
 
-Not shipped (roadmap only): seccomp-user-notify, netns/veth, cgroup v2, JSON Schema / PFC export, parser fuzzing.
+Not shipped (roadmap only): seccomp-user-notify, JSON Schema / PFC export, parser fuzzing.
 
 ## Measured metrics (this machine)
 
@@ -49,11 +49,18 @@ make metrics
 ./sandbox-run <policy.json> <program> [args...]
 ./sandbox-run --mount-ns --pid-ns policies/strict-allow.json \
   ./workloads/file_transform /tmp/in /tmp/out
+./sandbox-run --net-ns=loopback policies/basic.json ./tests/adversarial/try_egress
+./sandbox-run --cgroup --cgroup-pids-max=4 --cgroup-memory-max=64M \
+  policies/basic.json ./tests/adversarial/try_pids_limit
 ```
 
-Child order: optional userns + mount/`pivot_root` / PID ns → `PR_SET_NO_NEW_PRIVS` → Landlock → drop caps → `prlimit` → `close_range` → seccomp load → ready signal → `execv` (details in `docs/DESIGN.md`).
+`--net-ns=loopback` (or `veth-deny`) enters a user+net namespace, brings up `lo`, and leaves no default route (egress connect fails). Needs unprivileged user namespaces. `veth-deny` also needs `iproute2`.
 
-Policies: `basic.json` (compat, nearly permissive), `restrictive.json` (compat denies including `clone3`), `no-file-network.json`, `strict-allow.json` (default-deny allowlist + Landlock + rlimits + JSONL for `workloads/file_transform`).
+`--cgroup` creates a leaf under `/sys/fs/cgroup/ksb.sandbox` (or `SANDBOX_CGROUP_ROOT`) with `memory.max` / `pids.max` / `cpu.max`. One-time setup: `sudo ./scripts/setup_cgroup_root.sh`. On hosts where migrating into that root needs CAP_SYS_ADMIN, attach retries via `sudo -n tee …/cgroup.procs`; if that is unavailable, cgroup tests skip.
+
+Child order: optional userns + net/mount/`pivot_root` / PID ns → cgroup attach gate → `PR_SET_NO_NEW_PRIVS` → Landlock → drop caps → `prlimit` → `close_range` → seccomp load → ready signal → `execv` (details in `docs/DESIGN.md`).
+
+Policies: `basic.json`, `restrictive.json`, `no-file-network.json`, `strict-allow.json`, `netns-loopback.json`, `cgroup-pids.json`.
 
 ## Policy model
 

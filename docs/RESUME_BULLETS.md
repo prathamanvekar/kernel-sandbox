@@ -4,7 +4,7 @@ Replace only if you re-measure on another host. Numbers below are from Linux 6.1
 
 ## One-line tech stack
 
-`C, Linux seccomp-BPF (libseccomp, default-deny allowlists, NO_NEW_PRIVS), Landlock LSM (landlock_restrict_self), user/mount/PID namespaces, pivot_root, capabilities (bounding/ambient), prlimit, close_range, clone3, pidfd_open (logging), JSONL audit, adversarial CI, p50/p99 microbenchmarks`
+`C, Linux seccomp-BPF (libseccomp, default-deny allowlists, NO_NEW_PRIVS), Landlock LSM (landlock_restrict_self), user/mount/PID/net namespaces, pivot_root, veth, cgroup v2 (memory/cpu/pids), capabilities (bounding/ambient), prlimit, close_range, clone3, pidfd_open (logging), JSONL audit, adversarial CI, p50/p99 microbenchmarks`
 
 ## Bullets
 
