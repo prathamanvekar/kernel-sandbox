@@ -10,6 +10,9 @@ tests/adversarial/try_open_etc
 tests/adversarial/try_fork
 tests/adversarial/ld_preload_open
 tests/adversarial/landlock_probe
+tests/adversarial/try_egress
+tests/adversarial/try_loopback
+tests/adversarial/try_pids_limit
 tests/adversarial/libfake_preload.so
 
 # Runtime artifacts
