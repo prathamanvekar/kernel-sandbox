@@ -1,18 +1,35 @@
-# Process Sandbox (seccomp-BPF + Landlock)
+<div align="center">
 
-A Linux user-space launcher in C that runs a program under a JSON policy with kernel enforcement: **seccomp-BPF** (libseccomp) for the syscall surface, optional **Landlock** (`landlock_restrict_self`) for paths, optional **user/mount/PID namespaces** with **`pivot_root`**, **capability** bounding-set / ambient clear, **`prlimit`**, **`close_range`**, and explicit **`prctl(PR_SET_NO_NEW_PRIVS)`**. Structured **JSONL** audit plus a text log. Adversarial CI covers `clone3`, socket/fork denies, Landlock path deny, and an LD_PRELOAD negative control.
+# Process Sandbox
 
-Process-level confinement for short-lived workloads, not a container runtime. Threat model and filter-install order: [`docs/DESIGN.md`](docs/DESIGN.md).
+**seccomp-BPF · Landlock · namespaces · cgroup v2**
 
-## Tech stack (shipped)
+Linux C launcher. JSON policy. Kernel enforcement.
 
-`C · seccomp-BPF (libseccomp, default-deny allowlists, ERRNO/KILL_PROCESS, NO_NEW_PRIVS) · Landlock LSM · user/mount/PID/net namespaces · pivot_root · veth (optional) · cgroup v2 (memory/cpu/pids) · capabilities (bounding/ambient) · prlimit · close_range · clone3 · pidfd_open (logging) · JSONL audit · Make/CI · p50/p99 microbenchmarks · perf_event_open harness (skip if no PMU)`
+[![CI](https://github.com/prathamanvekar/kernel-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/prathamanvekar/kernel-sandbox/actions/workflows/ci.yml)
 
-Not shipped (roadmap only): seccomp-user-notify, JSON Schema / PFC export, parser fuzzing.
+</div>
 
-## Measured metrics (this machine)
+Process-level confinement for short-lived workloads - not a container runtime. Design: [`docs/DESIGN.md`](docs/DESIGN.md).
 
-Host: Linux 6.12.94+, Intel Xeon, 4 CPUs. Methodology: `taskset -c 0` when available; attach N=40 cold launches (`policies/basic.json` → `/bin/true`, timer stops at ready-pipe after `seccomp_load`); microloops 80 samples × 2000 iters, bare vs sandboxed. Artifact: [`reports/METRICS_LATEST.md`](reports/METRICS_LATEST.md). Re-run: `make metrics`. Not portable SLAs.
+## Shipped
+
+`sandbox-run` applies policy before `execv`:
+
+- **seccomp-BPF** (libseccomp) - default-deny allowlists, ERRNO / KILL_PROCESS, `PR_SET_NO_NEW_PRIVS`
+- **Landlock** (`landlock_restrict_self`) - path prefixes
+- **Namespaces** - user / mount / PID / net, optional `pivot_root`, optional veth
+- **cgroup v2** - memory / pids / cpu.max
+- **Caps / rlimits** - bounding + ambient clear, `prlimit`, `close_range`
+- **Audit** - JSONL + text log
+
+CI adversarial gates: `clone3`, socket/fork deny, Landlock path deny, LD_PRELOAD negative control.
+
+Not shipped: seccomp-user-notify, JSON Schema / PFC export, parser fuzzing.
+
+## Metrics
+
+Host: Linux 6.12.94+, Intel Xeon, 4 CPUs. `taskset -c 0` when available. Attach N=40 cold launches (`policies/basic.json` → `/bin/true`, stop at ready-pipe after `seccomp_load`). Microloops: 80 samples × 2000 iters, bare vs sandboxed. Artifact: [`reports/METRICS_LATEST.md`](reports/METRICS_LATEST.md). Re-run: `make metrics`. Not portable SLAs.
 
 | Signal | Result |
 | --- | --- |
@@ -22,26 +39,21 @@ Host: Linux 6.12.94+, Intel Xeon, 4 CPUs. Methodology: `taskset -c 0` when avail
 | write `/dev/null` per-op p50 bare → sandboxed | 74.5 ns → 83.5 ns |
 | Adversarial true-deny (`make check`) | 100% (4/4) |
 | Curated false-deny success (strict-allow file transform) | 100% (2/2) |
-| perf_event_open cycles | Unavailable here (`ENOENT`; no usable PMU). Recorded as skip, not invented. |
+| perf_event_open cycles | Skip (`ENOENT`; no PMU) |
 
-Prefer `make microbench` / `make metrics` for overhead. Legacy `make benchmark` times `test` (includes `sleep(1)`) and is smoke-only.
+Use `make microbench` / `make metrics`. Legacy `make benchmark` times `test` (includes `sleep(1)`) - smoke only.
 
-## Requirements
+## Build
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential libseccomp-dev libcap-dev strace
-```
-
-Landlock requires a kernel with the Landlock ABI (probed; tests skip if absent). Mount/PID ns needs user namespaces. Python 3 only for the optional GUI.
-
-## Build, check, measure
-
-```bash
 make
 make check
 make metrics
 ```
+
+Landlock needs a Landlock ABI kernel (probed; skip if absent). Mount/PID ns needs user namespaces. Python 3 for optional GUI only.
 
 ## Run
 
@@ -54,20 +66,32 @@ make metrics
   policies/basic.json ./tests/adversarial/try_pids_limit
 ```
 
-`--net-ns=loopback` (or `veth-deny`) enters a user+net namespace, brings up `lo`, and leaves no default route (egress connect fails). Needs unprivileged user namespaces. `veth-deny` also needs `iproute2`.
+`--net-ns=loopback` / `veth-deny`: user+net ns, `lo` up, no default route. Needs unprivileged userns. `veth-deny` needs `iproute2`.
 
-`--cgroup` creates a leaf under `/sys/fs/cgroup/ksb.sandbox` (or `SANDBOX_CGROUP_ROOT`) with `memory.max` / `pids.max` / `cpu.max`. One-time setup: `sudo ./scripts/setup_cgroup_root.sh`. On hosts where migrating into that root needs CAP_SYS_ADMIN, attach retries via `sudo -n tee …/cgroup.procs`; if that is unavailable, cgroup tests skip.
+`--cgroup`: leaf under `/sys/fs/cgroup/ksb.sandbox` (or `SANDBOX_CGROUP_ROOT`) with `memory.max` / `pids.max` / `cpu.max`. Setup: `sudo ./scripts/setup_cgroup_root.sh`. If migrate needs CAP_SYS_ADMIN, attach retries via `sudo -n tee …/cgroup.procs`; else cgroup tests skip.
 
-Child order: optional userns + net/mount/`pivot_root` / PID ns → cgroup attach gate → `PR_SET_NO_NEW_PRIVS` → Landlock → drop caps → `prlimit` → `close_range` → seccomp load → ready signal → `execv` (details in `docs/DESIGN.md`).
+Child order: optional userns + net/mount/`pivot_root` / PID ns → cgroup attach → `PR_SET_NO_NEW_PRIVS` → Landlock → drop caps → `prlimit` → `close_range` → seccomp load → ready → `execv`.
 
 Policies: `basic.json`, `restrictive.json`, `no-file-network.json`, `strict-allow.json`, `netns-loopback.json`, `cgroup-pids.json`.
 
-## Policy model
+## Policy
 
-`default_deny=true` sets filter default to `EPERM` or `KILL_PROCESS` and installs the `allow` list (compat mode remains default-allow plus deny overlays). `landlock` + `enforce_file_access` turn `file_access` prefixes into Landlock rules; argv checks are defense-in-depth only. Also: `drop_caps`, `close_fds`, `mount_ns`, `pid_ns`, `rlimit_*`, `audit_jsonl`, `kill_on_violation`. CLI: `--mount-ns`, `--pid-ns`, `--no-drop-caps`, `--audit-jsonl PATH`.
+`default_deny=true` → default `EPERM` or `KILL_PROCESS` + `allow` list. Compat mode: default-allow + deny overlays. `landlock` + `enforce_file_access` map `file_access` prefixes to Landlock. Argv checks are defense-in-depth only.
 
-Seccomp does not inspect path strings. Path policy is Landlock and/or mount-ns + `pivot_root`. LD_PRELOAD is not the security boundary.
+Also: `drop_caps`, `close_fds`, `mount_ns`, `pid_ns`, `rlimit_*`, `audit_jsonl`, `kill_on_violation`. CLI: `--mount-ns`, `--pid-ns`, `--no-drop-caps`, `--audit-jsonl PATH`.
+
+Seccomp does not see path strings. Path policy is Landlock and/or mount-ns + `pivot_root`. LD_PRELOAD is not the boundary.
 
 ## Layout
 
-`sandbox.c` → `sandbox-run`. `workloads/file_transform.c` curated allowlist target. `bench/` microloops + perf companion. `tests/adversarial/` true-deny binaries. `policies/`, `scripts/`, `reports/`, `.github/workflows/ci.yml`. GUI: `make gui` → `http://127.0.0.1:8080`.
+| Path | Role |
+| --- | --- |
+| `sandbox.c` → `sandbox-run` | Launcher |
+| `workloads/file_transform.c` | Curated allowlist target |
+| `bench/` | Microloops + perf companion |
+| `tests/adversarial/` | True-deny binaries |
+| `policies/` | Example JSON policies |
+| `scripts/` | Helpers (cgroup root setup) |
+| `reports/` | Metrics artifacts |
+| `.github/workflows/ci.yml` | Build + adversarial gates |
+| `make gui` → `http://127.0.0.1:8080` | Optional GUI |
