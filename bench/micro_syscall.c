@@ -44,12 +44,12 @@ static void usage(const char *argv0) {
 
 int main(int argc, char *argv[]) {
     const char *mode;
-    size_t samples = 100;
-    size_t iters = 1000;
+    size_t samples = 100; /* timed batches feeding p50/p99 */
+    size_t iters = 1000; /* syscalls per sample; divides into per-op latency */
     size_t i, s;
-    int64_t *times;
+    int64_t *times; /* per-sample wall ns for the iters loop */
     int64_t p50, p99;
-    volatile long sink = 0;
+    volatile long sink = 0; /* keep measured syscalls from being optimized out */
 
     if (argc < 2) {
         usage(argv[0]);

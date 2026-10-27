@@ -24,8 +24,8 @@ static int open_counter(__u32 type, __u64 config) {
     attr.type = type;
     attr.size = sizeof(attr);
     attr.config = config;
-    attr.disabled = 1;
-    attr.exclude_kernel = 0;
+    attr.disabled = 1; /* enable explicitly around the measured loop */
+    attr.exclude_kernel = 0; /* include kernel time in syscall cost */
     attr.exclude_hv = 1;
     return (int)perf_event_open(&attr, 0, -1, -1, 0);
 }
@@ -38,11 +38,11 @@ int main(int argc, char *argv[]) {
     const char *mode;
     size_t iters = 100000;
     size_t i;
-    int fd_cycles;
-    int fd_instr;
+    int fd_cycles; /* PERF_COUNT_HW_CPU_CYCLES group leader fd */
+    int fd_instr; /* PERF_COUNT_HW_INSTRUCTIONS counter fd */
     uint64_t cycles = 0;
     uint64_t instr = 0;
-    volatile long sink = 0;
+    volatile long sink = 0; /* keep measured syscalls from being optimized out */
 
     if (argc < 2) {
         usage(argv[0]);
