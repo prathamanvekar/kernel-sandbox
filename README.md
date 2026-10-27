@@ -1,8 +1,22 @@
-# Process Sandbox (seccomp-BPF + Landlock)
+<div align="center">
 
-A Linux user-space launcher in C that runs a program under a JSON policy with kernel enforcement: **seccomp-BPF** (libseccomp) for the syscall surface, optional **Landlock** (`landlock_restrict_self`) for paths, optional **user/mount/PID namespaces** with **`pivot_root`**, **capability** bounding-set / ambient clear, **`prlimit`**, **`close_range`**, and explicit **`prctl(PR_SET_NO_NEW_PRIVS)`**. Structured **JSONL** audit plus a text log. Adversarial CI covers `clone3`, socket/fork denies, Landlock path deny, and an LD_PRELOAD negative control.
+# Process Sandbox
 
-Process-level confinement for short-lived workloads, not a container runtime. Threat model and filter-install order: [`docs/DESIGN.md`](docs/DESIGN.md).
+**seccomp-BPF · Landlock · namespaces · cgroup v2**
+
+A Linux user-space launcher that confines a program under a JSON policy with kernel enforcement.
+
+[![CI](https://github.com/prathamanvekar/kernel-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/prathamanvekar/kernel-sandbox/actions/workflows/ci.yml)
+
+</div>
+
+Process-level confinement for short-lived workloads - not a container runtime. Threat model and filter-install order live in [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## What it enforces
+
+The launcher (`sandbox-run`) applies a JSON policy before `execv`: **seccomp-BPF** via libseccomp for the syscall surface, optional **Landlock** (`landlock_restrict_self`) for path prefixes, optional **user / mount / PID / net** namespaces with **`pivot_root`**, **capability** bounding-set and ambient clear, **`prlimit`**, **`close_range`**, and explicit **`prctl(PR_SET_NO_NEW_PRIVS)`**. Optional **cgroup v2** limits cover memory, pids, and cpu.max. Structured **JSONL** audit sits alongside a text log.
+
+Adversarial CI covers `clone3`, socket/fork denies, Landlock path deny, and an LD_PRELOAD negative control.
 
 ## Tech stack (shipped)
 
@@ -70,4 +84,14 @@ Seccomp does not inspect path strings. Path policy is Landlock and/or mount-ns +
 
 ## Layout
 
-`sandbox.c` → `sandbox-run`. `workloads/file_transform.c` curated allowlist target. `bench/` microloops + perf companion. `tests/adversarial/` true-deny binaries. `policies/`, `scripts/`, `reports/`, `.github/workflows/ci.yml`. GUI: `make gui` → `http://127.0.0.1:8080`.
+| Path | Role |
+| --- | --- |
+| `sandbox.c` → `sandbox-run` | Launcher binary |
+| `workloads/file_transform.c` | Curated allowlist target |
+| `bench/` | Microloops + perf companion |
+| `tests/adversarial/` | True-deny binaries |
+| `policies/` | Example JSON policies |
+| `scripts/` | Helpers (e.g. cgroup root setup) |
+| `reports/` | Measured metrics artifacts |
+| `.github/workflows/ci.yml` | Build + adversarial gates |
+| `make gui` → `http://127.0.0.1:8080` | Optional local GUI |
