@@ -37,45 +37,45 @@
 #define MAX_ITEMS 256
 
 typedef struct {
-    char *allow[MAX_ITEMS];
+    char *allow[MAX_ITEMS]; /* syscalls permitted under default_deny */
     size_t allow_count;
-    char *deny[MAX_ITEMS];
+    char *deny[MAX_ITEMS]; /* named syscalls forced deny in compat mode */
     size_t deny_count;
-    char *file_access[MAX_ITEMS];
+    char *file_access[MAX_ITEMS]; /* path prefixes for Landlock / argv checks */
     size_t file_access_count;
-    bool network;
-    bool block_process;
-    bool block_file;
-    bool block_info;
-    bool enforce_file_access;
-    bool kill_on_violation;
-    bool default_deny;
-    bool landlock;
-    bool drop_caps;
-    bool mount_ns;
-    bool pid_ns;
-    bool close_fds;
-    bool cgroup;
-    long rlimit_as_mb;
-    long rlimit_nofile;
-    long rlimit_nproc;
-    long cgroup_pids_max;
+    bool network; /* false => block network syscall family */
+    bool block_process; /* deny fork/vfork/clone/clone3 */
+    bool block_file; /* deny open/creat/unlink-class syscalls */
+    bool block_info; /* deny info-style syscalls (e.g. getpid) */
+    bool enforce_file_access; /* pre-exec argv path allowlist check */
+    bool kill_on_violation; /* SCMP_ACT_KILL_PROCESS vs EPERM */
+    bool default_deny; /* default action deny; allow list installs exceptions */
+    bool landlock; /* apply Landlock FS ruleset from file_access */
+    bool drop_caps; /* clear ambient + bounding set + effective caps */
+    bool mount_ns; /* user+mount ns then pivot_root sandbox root */
+    bool pid_ns; /* nested PID namespace (requires userns) */
+    bool close_fds; /* scrub inherited FDs before exec */
+    bool cgroup; /* create/attach leaf under cgroup v2 root */
+    long rlimit_as_mb; /* RLIMIT_AS in MiB; <0 = unset */
+    long rlimit_nofile; /* RLIMIT_NOFILE; <0 = unset */
+    long rlimit_nproc; /* RLIMIT_NPROC; <0 = unset */
+    long cgroup_pids_max; /* pids.max; <0 = leave controller default */
     char net_ns_mode[32]; /* "", "loopback", "veth-deny" */
-    char cgroup_root[PATH_MAX];
-    char cgroup_memory_max[64];
+    char cgroup_root[PATH_MAX]; /* preferred writable cgroup v2 root */
+    char cgroup_memory_max[64]; /* memory.max string; empty = unchanged */
     char cgroup_cpu_max[64]; /* e.g. "10000 100000" or "max" */
-    char log_file[PATH_MAX];
-    char audit_jsonl[PATH_MAX];
+    char log_file[PATH_MAX]; /* human log path; empty disables */
+    char audit_jsonl[PATH_MAX]; /* structured audit stream; empty disables */
 } sandbox_policy;
 
 typedef struct {
     const sandbox_policy *policy;
     char *target_exec;
     char **child_argv;
-    int ready_fd;
+    int ready_fd; /* write 'R' once filter is installed, before exec */
     int map_sync_fd; /* bidirectional sync for userns maps when required */
     int cgroup_gate_fd; /* child blocks until parent finishes cgroup attach */
-    char run_id[64];
+    char run_id[64]; /* correlator for audit_jsonl events */
     const char *policy_path;
 } child_ctx;
 
@@ -775,7 +775,7 @@ static int apply_compat_denies(scmp_filter_ctx ctx, const sandbox_policy *policy
 
 static int apply_default_deny_allows(scmp_filter_ctx ctx, const sandbox_policy *policy) {
     size_t i;
-    bool saw_execve = false;
+    bool saw_execve = false; /* force-allow execve if policy forgot it */
 
     if (policy->allow_count == 0) {
         fprintf(stderr, "[Policy] default_deny requires a non-empty allow list\n");
@@ -817,6 +817,7 @@ static int apply_default_deny_allows(scmp_filter_ctx ctx, const sandbox_policy *
 }
 
 static int apply_policy(scmp_filter_ctx ctx, const sandbox_policy *policy) {
+    /* Compat-mode deny payload; unused when default_deny installs allows instead. */
     uint32_t deny_action = policy->kill_on_violation ? SCMP_ACT_KILL_PROCESS : SCMP_ACT_ERRNO(EPERM);
 
     printf("[Policy] Applying sandbox rules (default_deny=%s, action=%s)...\n",
@@ -927,7 +928,7 @@ static int apply_rlimits(const sandbox_policy *policy) {
 
 static int scrub_fds(int keep_fd) {
     /* Keep stdin/stdout/stderr and optional ready pipe; close everything else. */
-    unsigned int first = 3;
+    unsigned int first = 3; /* first FD eligible to close (0-2 stay open) */
     int rc = -1;
 
     if (keep_fd >= (int)first) {
@@ -994,11 +995,11 @@ static __u64 landlock_access_fs_allow(int abi) {
 }
 
 static int apply_landlock_with_target(const sandbox_policy *policy, const char *target_exec) {
-    int abi;
+    int abi; /* Landlock ABI version; gates which access bits exist */
     int ruleset_fd;
     size_t i;
     struct landlock_ruleset_attr attr;
-    char target_dir[PATH_MAX];
+    char target_dir[PATH_MAX]; /* dirname of target_exec, always path_beneath-allowed */
     char *slash;
 
     if (!policy->landlock || !policy->enforce_file_access || policy->file_access_count == 0) {
@@ -1283,7 +1284,7 @@ static int write_cgroup_file(const char *dir, const char *name, const char *valu
 
 static int cgroup_resolve_root(const sandbox_policy *policy, char *out, size_t out_sz) {
     const char *env = getenv("SANDBOX_CGROUP_ROOT");
-    const char *candidates[4];
+    const char *candidates[4]; /* policy path, env, then default delegated root */
     size_t n = 0;
     size_t i;
 
@@ -1321,8 +1322,8 @@ static int cgroup_resolve_root(const sandbox_policy *policy, char *out, size_t o
  * (see docs). Returns 0 and fills created_path; -1 if unavailable.
  */
 static int cgroup_create(const sandbox_policy *policy, char *created_path, size_t created_sz) {
-    char root[PATH_MAX];
-    char leaf[PATH_MAX];
+    char root[PATH_MAX]; /* writable delegated cgroup v2 root */
+    char leaf[PATH_MAX]; /* per-run leaf: memory/pids/cpu limits applied here */
     char buf[128];
 
     if (!policy->cgroup) {
@@ -1380,8 +1381,8 @@ static int cgroup_create(const sandbox_policy *policy, char *created_path, size_
 }
 
 static int cgroup_attach_pid(const char *cgroup_path, pid_t pid) {
-    char buf[32];
-    char procs_path[PATH_MAX];
+    char buf[32]; /* pid string written into cgroup.procs */
+    char procs_path[PATH_MAX]; /* used by sudo helper when direct write fails */
     if (!cgroup_path || !cgroup_path[0]) {
         return 0;
     }
@@ -1460,12 +1461,12 @@ static void cgroup_cleanup(const char *cgroup_path) {
 }
 
 static int setup_mount_ns(const sandbox_policy *policy, const char *target_exec) {
-    char root[PATH_MAX];
-    char put_old[PATH_MAX];
-    char tmpbase[] = "/tmp/ksb-XXXXXX";
+    char root[PATH_MAX]; /* new rootfs under tmpfs before pivot_root */
+    char put_old[PATH_MAX]; /* pivot_root old-root mountpoint under new root */
+    char tmpbase[] = "/tmp/ksb-XXXXXX"; /* mkdtemp template for private mount tree */
     size_t i;
     char target_dir[PATH_MAX];
-    char dst[8192];
+    char dst[8192]; /* host path remapped under root for bind mounts */
     char *slash;
 
     if (!policy->mount_ns) {
@@ -1594,8 +1595,8 @@ static int parent_map_child_userns(pid_t pid) {
 }
 
 static int install_filter(const sandbox_policy *policy) {
-    uint32_t default_action;
-    scmp_filter_ctx ctx;
+    uint32_t default_action; /* SCMP default for all non-listed syscalls */
+    scmp_filter_ctx ctx; /* libseccomp filter built then loaded into the kernel */
 
     if (policy->default_deny) {
         default_action =
@@ -1728,7 +1729,7 @@ int main(int argc, char *argv[]) {
     pid_t pid;
     int status;
     int i;
-    int argi = 1;
+    int argi = 1; /* first non-consumed argv index after option parse */
     bool cli_mount_ns = false;
     bool cli_pid_ns = false;
     bool cli_no_drop_caps = false;
@@ -1738,17 +1739,17 @@ int main(int argc, char *argv[]) {
     const char *cli_cg_mem = NULL;
     const char *cli_cg_cpu = NULL;
     const char *cli_cg_root = NULL;
-    long cli_cg_pids = -1;
-    int ready_pipe[2] = {-1, -1};
-    int map_from_child[2] = {-1, -1};
-    int map_to_child[2] = {-1, -1};
-    int cgroup_gate[2] = {-1, -1};
-    int64_t t0, t1;
+    long cli_cg_pids = -1; /* CLI override; <0 means leave policy value */
+    int ready_pipe[2] = {-1, -1}; /* child writes 'R' when filter is ready */
+    int map_from_child[2] = {-1, -1}; /* child->parent: userns ready for uid/gid map */
+    int map_to_child[2] = {-1, -1}; /* parent->child: maps written, continue setup */
+    int cgroup_gate[2] = {-1, -1}; /* parent->child: proceed after cgroup.procs attach */
+    int64_t t0, t1; /* wall-clock ns around fork..wait for audit */
     char run_id[64];
-    char cgroup_path[PATH_MAX];
+    char cgroup_path[PATH_MAX]; /* leaf path from cgroup_create; empty if unused */
     child_ctx ctx;
-    bool use_userns = false;
-    int cg_rc;
+    bool use_userns = false; /* any of mount/pid/net ns needs CLONE_NEWUSER */
+    int cg_rc; /* 0 ok, >0 soft-skip, <0 hard fail */
 
     cgroup_path[0] = '\0';
 
@@ -1970,8 +1971,8 @@ int main(int argc, char *argv[]) {
             close(map_from_child[0]);
             close(map_to_child[1]);
             {
-                int uflags = CLONE_NEWUSER;
-                char b = 0;
+                int uflags = CLONE_NEWUSER; /* mount_ns ORs CLONE_NEWNS below */
+                char b = 0; /* map_to_child handshake byte; expect 'G' */
                 if (policy.mount_ns) {
                     uflags |= CLONE_NEWNS;
                 }
@@ -2025,7 +2026,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (cgroup_path[0]) {
-        char go = 'C';
+        char go = 'C'; /* gate token: child proceeds only after attach succeeds */
         int attach_rc;
         close(cgroup_gate[0]);
         attach_rc = cgroup_attach_pid(cgroup_path, pid);
@@ -2063,7 +2064,7 @@ int main(int argc, char *argv[]) {
     audit_jsonl(&policy, run_id, "forked", pid, "\"policy\":\"%s\"", argv[argi]);
 
     {
-        char ready = 0;
+        char ready = 0; /* expect 'R' from child after seccomp load */
         ssize_t n = read(ready_pipe[0], &ready, 1);
         t1 = now_ns();
         close(ready_pipe[0]);
@@ -2082,7 +2083,7 @@ int main(int argc, char *argv[]) {
      * clone pid in the parent namespace. pidfd_open is used when available for
      * a stable handle log line (PID-recycle safety for tooling). */
     {
-        int pfd = -1;
+        int pfd = -1; /* stable handle for audit; avoids PID-reuse confusion */
 #ifdef __NR_pidfd_open
         pfd = (int)syscall(__NR_pidfd_open, pid, 0);
 #endif
